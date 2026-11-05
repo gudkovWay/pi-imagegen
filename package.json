@@ -13,6 +13,8 @@
   ],
   "files": [
     "imagegen.ts",
+    "image-request.ts",
+    "native-gallery.ts",
     "README.md"
   ],
   "repository": {

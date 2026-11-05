@@ -8,20 +8,20 @@
 
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "typebox";
+import { buildRequest, IMAGE_MODEL, mimeFromFormat } from "./image-request";
+import { GalleryModal, GalleryPreview, type GalleryChoice, type GalleryItem } from "./native-gallery";
 
 const PROVIDER = "openai-codex";
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-const DEFAULT_RESPONSE_MODEL = "gpt-5.5";
-const IMAGE_MODEL = "gpt-image-2";
 
 const SIZES = ["auto", "1024x1024", "1536x1024", "1024x1536"] as const;
 const QUALITIES = ["auto", "low", "medium", "high"] as const;
@@ -80,7 +80,7 @@ const TOOL_PARAMS = Type.Object({
 	),
 });
 
-type ToolParams = Static<typeof TOOL_PARAMS>;
+export type ToolParams = Static<typeof TOOL_PARAMS>;
 
 interface ImagegenMetadata {
 	createdAt: string;
@@ -104,7 +104,7 @@ interface ImagegenMetadata {
 	batchPrompt?: string;
 	batchIndex?: number;
 	batchCount?: number;
-	kind?: "generated" | "sketch";
+	kind?: "generated" | "sketch" | "imported";
 }
 
 interface ImagegenDetails {
@@ -145,11 +145,6 @@ function getAccountId(token: string): string {
 	return accountId;
 }
 
-function mimeFromFormat(format: string): string {
-	if (format === "jpeg") return "image/jpeg";
-	if (format === "webp") return "image/webp";
-	return "image/png";
-}
 
 function extensionFromFormat(format: string): string {
 	return format === "jpeg" ? "jpg" : format;
@@ -227,6 +222,30 @@ async function readRecentMetadata(limit = 10): Promise<ImagegenMetadata[]> {
 		}
 	}
 	return [...byImageId.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
+}
+
+async function importImages(paths: string[], cwd: string): Promise<ImagegenMetadata[]> {
+	const batchId = `import-${randomUUID()}`;
+	const results: ImagegenMetadata[] = [];
+	for (const [index, input] of paths.entries()) {
+		const savedPath = await realpath(resolve(cwd, input.startsWith("@") ? input.slice(1) : input));
+		const extension = extname(savedPath).toLowerCase();
+		const mimeType = ({ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" } as Record<string, string>)[extension];
+		if (!mimeType || !(await stat(savedPath)).isFile()) throw new Error(`Expected PNG, JPEG or WebP image: ${savedPath}`);
+		results.push({
+			createdAt: new Date().toISOString(), prompt: basename(savedPath),
+			provider: "local", responseModel: "none", imageModel: "imported",
+			imageId: `local-${createHash("sha256").update(savedPath).digest("hex")}`,
+			savedPath, metadataPath: "", mimeType, size: "original", quality: "original",
+			background: "opaque", outputFormat: extension.slice(1), thinking: "off", kind: "imported",
+			batchId, batchIndex: index + 1, batchCount: paths.length,
+		});
+	}
+	for (const metadata of results) {
+		metadata.metadataPath = join(getAgentDir(), "generated-images", "index", `${metadata.imageId}.json`);
+		await saveMetadata(metadata);
+	}
+	return results;
 }
 
 async function resolveImageTarget(target: string, cwd: string): Promise<string | undefined> {
@@ -338,54 +357,6 @@ function insertImageIntoPrompt(path: string, ctx: ExtensionContext | undefined):
 	return true;
 }
 
-async function buildRequest(params: ToolParams, responseModel: string, sessionId: string) {
-	const size = params.size ?? "auto";
-	const quality = params.quality ?? "auto";
-	const background = params.background ?? "auto";
-	const outputFormat = params.outputFormat ?? "png";
-	const thinking = params.thinking ?? "low";
-	const content: any[] = [{ type: "input_text", text: `Generate this image: ${params.prompt}` }];
-	for (const path of params.referencePaths ?? []) {
-		const format = extname(path).toLowerCase() === ".jpg" ? "jpeg" : extname(path).toLowerCase().replace(/^\./, "") || "png";
-		const mimeType = mimeFromFormat(format);
-		const data = await readFile(path);
-		content.push({ type: "input_image", image_url: `data:${mimeType};base64,${data.toString("base64")}` });
-	}
-	const request: any = {
-		model: responseModel,
-		store: false,
-		stream: true,
-		instructions:
-			"You are an image generation dispatcher. Use the image_generation tool to create exactly the image requested by the user. Do not write code.",
-		input: [
-			{
-				role: "user",
-				content,
-			},
-		],
-		text: { verbosity: "low" },
-		prompt_cache_key: sessionId,
-		tool_choice: "auto",
-		parallel_tool_calls: true,
-		tools: [
-			{
-				type: "image_generation",
-				background,
-				model: IMAGE_MODEL,
-				moderation: "auto",
-				output_compression: 100,
-				output_format: outputFormat,
-				quality,
-				size,
-			},
-		],
-	};
-	if (thinking !== "off") {
-		request.include = ["reasoning.encrypted_content"];
-		request.reasoning = { effort: thinking, summary: "auto" };
-	}
-	return request;
-}
 
 async function parseSseForImage(response: Response, signal?: AbortSignal) {
 	if (!response.body) throw new Error("No response body from Codex image generation request.");
@@ -451,7 +422,6 @@ async function parseSseForImage(response: Response, signal?: AbortSignal) {
 
 type ImagegenContext = {
 	cwd: string;
-	model?: { provider: string; id: string };
 	modelRegistry: { getApiKeyForProvider: (provider: string) => Promise<string | undefined> };
 };
 
@@ -470,9 +440,9 @@ async function generateImage(
 	}
 
 	const accountId = getAccountId(token);
-	const responseModel = ctx.model?.provider === PROVIDER ? ctx.model.id : DEFAULT_RESPONSE_MODEL;
 	const sessionId = randomUUID();
-	const body = await buildRequest(params, responseModel, sessionId);
+	const body = await buildRequest(params, sessionId);
+	const responseModel = body.model;
 	const outputFormat = params.outputFormat ?? "png";
 	const mimeType = mimeFromFormat(outputFormat);
 
@@ -596,32 +566,25 @@ function renderStudioPage(token: string): string {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
 <style>
-/*
-  Pi Image Studio — "Daylight Gallery"
-  ------------------------------------
-  A bright, quiet room for images. The chrome stays out of the way:
-  warm paper surface, hairline borders, one cobalt signal color.
-  Geist for UI, Geist Mono for numerics, Newsreader italic as the
-  prompt voice. The work hangs uncropped on the wall; the composer
-  floats beneath it like a caption card.
-*/
 :root{
-  color-scheme:light;
-  --bg:#f5f5f1;
-  --bg-2:#ecece6;
-  --card:#ffffff;
-  --ink:#161511;
-  --ink-2:#3d3b34;
-  --ink-3:#6f6c62;
-  --muted:#98948a;
-  --hair:rgba(22,21,17,0.08);
-  --hair-2:rgba(22,21,17,0.14);
-  --accent:#2b4bdf;
-  --accent-soft:rgba(43,75,223,0.10);
-  --live:#1f7a4d;
-  --shadow-soft:0 1px 2px rgba(22,21,17,0.04),0 8px 24px -12px rgba(22,21,17,0.10);
-  --shadow-float:0 2px 6px rgba(22,21,17,0.05),0 24px 64px -24px rgba(22,21,17,0.22);
-  --shadow-modal:0 40px 120px -24px rgba(22,21,17,0.35);
+  color-scheme:dark;
+  --bg:#111214;
+  --bg-2:#25282e;
+  --card:#1b1d21;
+  --ink:#f1f2f4;
+  --ink-2:#d1d4da;
+  --ink-3:#b3b8c2;
+  --muted:#a4abb7;
+  --hair:rgba(241,242,244,0.10);
+  --hair-2:rgba(241,242,244,0.20);
+  --accent:#8caeff;
+  --accent-soft:rgba(140,174,255,0.14);
+  --live:#63d49b;
+  --action:#303b50;
+  --action-hover:#40516f;
+  --shadow-soft:0 1px 2px rgba(0,0,0,0.20),0 8px 24px -12px rgba(0,0,0,0.35);
+  --shadow-float:0 2px 6px rgba(0,0,0,0.25),0 24px 64px -24px rgba(0,0,0,0.60);
+  --shadow-modal:0 40px 120px -24px rgba(0,0,0,0.65);
   --sans:"Geist",-apple-system,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
   --serif:"Newsreader","Iowan Old Style","Hoefler Text",Georgia,serif;
   --mono:"Geist Mono","SF Mono",ui-monospace,Menlo,monospace;
@@ -636,14 +599,10 @@ body{
   -webkit-font-smoothing:antialiased;
   overflow:hidden;
 }
-body::before{
-  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
-  background:
-    radial-gradient(1000px 600px at 12% -6%, rgba(255,224,180,0.20), transparent 60%),
-    radial-gradient(1100px 700px at 100% 104%, rgba(184,201,255,0.16), transparent 62%);
-}
 ::selection{background:var(--ink);color:var(--bg)}
 button{font:inherit}
+button:focus-visible,.select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.select option{background:var(--card);color:var(--ink)}
 
 .studio{height:100vh;display:flex;flex-direction:column;position:relative;z-index:1}
 
@@ -653,9 +612,7 @@ button{font:inherit}
   display:grid;grid-template-columns:1fr auto 1fr;align-items:center;
   padding:0 24px;
   border-bottom:1px solid var(--hair);
-  background:rgba(245,245,241,0.78);
-  backdrop-filter:blur(12px) saturate(1.05);
-  -webkit-backdrop-filter:blur(12px) saturate(1.05);
+  background:var(--bg);
   position:relative;z-index:4;
 }
 .brand{display:flex;align-items:baseline;gap:9px}
@@ -686,7 +643,7 @@ button{font:inherit}
   font-family:var(--mono);font-size:10.5px;letter-spacing:0.06em;color:var(--ink-3);
   padding:5px 11px;border:1px solid var(--hair);border-radius:999px;background:var(--card);
 }
-.dot{width:6px;height:6px;border-radius:50%;background:#c9c5ba;flex:none}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex:none}
 .status.live .dot{background:var(--live);animation:beat 2s ease-out infinite}
 .status.busy .dot{background:var(--accent);animation:beat 1s ease-out infinite}
 @keyframes beat{
@@ -712,7 +669,7 @@ button{font:inherit}
   position:absolute;top:8px;right:8px;
   width:26px;height:26px;border:0;border-radius:8px;cursor:pointer;
   display:grid;place-items:center;
-  background:rgba(255,255,255,0.92);color:var(--ink);
+  background:var(--card);color:var(--ink);
   box-shadow:0 1px 4px rgba(22,21,17,0.18);
   opacity:0;transform:translateY(-3px);
   transition:opacity .15s,transform .15s,background .15s;
@@ -720,7 +677,7 @@ button{font:inherit}
 .tile:hover .add{opacity:1;transform:none}
 .tile .add:hover{background:var(--ink);color:var(--bg)}
 .tile.ph{aspect-ratio:1;cursor:default;box-shadow:0 0 0 1px var(--hair);
-  background:linear-gradient(100deg,var(--bg-2) 40%,#f7f7f3 50%,var(--bg-2) 60%);
+  background:linear-gradient(100deg,var(--bg-2) 40%,var(--card) 50%,var(--bg-2) 60%);
   background-size:220% 100%;animation:shimmer 1.4s linear infinite;
 }
 .tile.ph::after{
@@ -750,12 +707,10 @@ button{font:inherit}
 .composer{
   position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
   width:min(760px,calc(100vw - 40px));
-  background:rgba(255,255,255,0.94);
+  background:var(--card);
   border:1px solid var(--hair-2);
   border-radius:18px;
   box-shadow:var(--shadow-float);
-  backdrop-filter:blur(20px) saturate(1.1);
-  -webkit-backdrop-filter:blur(20px) saturate(1.1);
   z-index:5;padding:14px 14px 10px;
 }
 .refs{display:none;gap:8px;flex-wrap:wrap;padding:0 4px 10px}
@@ -786,7 +741,7 @@ button{font:inherit}
   appearance:none;-webkit-appearance:none;border:0;background:transparent;cursor:pointer;
   color:var(--ink);font-family:var(--mono);font-size:11.5px;text-transform:none;letter-spacing:0;
   padding:0 13px 0 0;outline:none;
-  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'><path d='M0 0l4 5 4-5z' fill='%236f6c62'/></svg>");
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'><path d='M0 0l4 5 4-5z' fill='%23b3b8c2'/></svg>");
   background-repeat:no-repeat;background-position:right center;
 }
 .select:focus{color:var(--accent)}
@@ -798,7 +753,7 @@ button{font:inherit}
 }
 .steps button:last-child{border-right:0}
 .steps button:hover{background:var(--bg-2)}
-.steps button.active{background:var(--ink);color:var(--bg)}
+.steps button.active{background:var(--action);color:var(--ink)}
 .spacer{flex:1;min-width:6px}
 .ghost-btn{
   display:inline-flex;align-items:center;gap:7px;cursor:pointer;
@@ -810,12 +765,12 @@ button{font:inherit}
 .ghost-btn svg{width:13px;height:13px}
 .generate{
   border:0;cursor:pointer;display:inline-flex;align-items:center;gap:9px;
-  background:var(--ink);color:var(--bg);
+  background:var(--action);color:var(--ink);
   font-size:12.5px;font-weight:600;height:32px;padding:0 14px;border-radius:10px;
   transition:background .15s,transform .12s;
   box-shadow:0 1px 2px rgba(22,21,17,0.3),0 8px 20px -10px rgba(22,21,17,0.5);
 }
-.generate:hover{background:#000;transform:translateY(-1px)}
+.generate:hover{background:var(--action-hover);transform:translateY(-1px)}
 .generate:active{transform:none}
 .generate:disabled{opacity:.55;cursor:default;transform:none}
 .generate .ret{
@@ -827,9 +782,7 @@ button{font:inherit}
 /* ── lightbox ── */
 .modal{
   position:fixed;inset:0;z-index:8;display:none;flex-direction:column;align-items:center;justify-content:center;
-  background:rgba(245,245,241,0.82);
-  backdrop-filter:blur(10px) saturate(1.03);
-  -webkit-backdrop-filter:blur(10px) saturate(1.03);
+  background:var(--bg);
 }
 .modal.open{display:flex;animation:fadeIn .16s ease}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
@@ -853,7 +806,7 @@ button{font:inherit}
 }
 .modal-bar{
   position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
-  display:flex;align-items:center;background:rgba(255,255,255,0.95);
+  display:flex;align-items:center;background:var(--card);
   border:1px solid var(--hair-2);box-shadow:var(--shadow-float);z-index:9;
   border-radius:12px;overflow:hidden;
 }
@@ -885,7 +838,7 @@ button{font:inherit}
 /* ── canvas / sketch ── */
 .sk-modal{
   position:fixed;inset:0;z-index:11;display:none;align-items:center;justify-content:center;
-  background:rgba(236,236,230,0.85);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  background:rgba(17,18,20,0.94);
 }
 .sk-modal.open{display:flex;animation:fadeIn .16s ease}
 .sk-panel{
@@ -910,7 +863,7 @@ button{font:inherit}
   transition:background .12s,color .12s;
 }
 .sk-rail .tool:hover,.sk-rail .op:hover{background:var(--bg-2);color:var(--ink)}
-.sk-rail .tool.active{background:var(--ink);color:var(--bg)}
+.sk-rail .tool.active{background:var(--action);color:var(--ink)}
 .sk-rail .op:disabled{opacity:.35;cursor:default}
 .sk-rail .op:disabled:hover{background:transparent;color:var(--ink-3)}
 .sk-rail hr{width:22px;border:0;border-top:1px solid var(--hair-2);margin:6px 0}
@@ -951,16 +904,16 @@ button{font:inherit}
 .size-dot i{display:block;border-radius:50%;background:var(--ink)}
 .sk-foot .primary{
   border:0;cursor:pointer;margin-left:auto;
-  background:var(--ink);color:var(--bg);font-size:12.5px;font-weight:600;
+  background:var(--action);color:var(--ink);font-size:12.5px;font-weight:600;
   height:32px;padding:0 14px;border-radius:10px;
   transition:background .15s,transform .12s;
 }
-.sk-foot .primary:hover{background:#000;transform:translateY(-1px)}
+.sk-foot .primary:hover{background:var(--action-hover);transform:translateY(-1px)}
 
 /* ── toast ── */
 .toast{
   position:fixed;left:50%;top:16px;transform:translateX(-50%);
-  background:var(--ink);color:var(--bg);padding:8px 16px;
+  background:var(--card);color:var(--ink);border:1px solid var(--hair-2);padding:8px 16px;
   font-size:12px;font-weight:500;display:none;z-index:20;border-radius:999px;
   box-shadow:0 10px 30px -10px rgba(22,21,17,0.4);
 }
@@ -979,7 +932,9 @@ button{font:inherit}
   .pill{padding:0 8px}
   .spacer{display:none}
   .generate{margin-left:auto}
-  .nav{display:none}
+  .nav{top:18px;transform:none;width:44px;height:44px}
+  .nav.prev{left:calc(50% - 92px)}
+  .nav.next{right:calc(50% - 92px)}
   .modal-bar{flex-wrap:wrap;width:calc(100vw - 20px);justify-content:center}
   .sk-hint{display:none}
   .sk-main{flex-direction:column}
@@ -1202,13 +1157,15 @@ function openModal(){
         '<button data-act="rerun">Rerun</button>'+
         '<button data-act="ref">Use ref</button>'+
         '<button data-act="copyprompt">Copy prompt</button>'+
+        '<button data-act="annotate">Plannotator</button>'+
         '<button data-act="open">Open</button>'+
         '<button data-act="reveal">Reveal</button>'+
       '</div>';
     $('[data-close]').onclick=closeModal;
-    $$('[data-act]').forEach(b=>b.onclick=e=>{e.stopPropagation();act(b.dataset.act)});
+    $$('[data-act]').forEach(b=>b.onclick=async e=>{e.stopPropagation();b.disabled=true;try{await act(b.dataset.act)}catch(error){toast(error.message)}finally{b.disabled=false}});
     $$('[data-nav]').forEach(b=>b.onclick=e=>{e.stopPropagation();move(b.dataset.nav==='next'?1:-1)});
     m.onclick=e=>{if(e.target.id==='modal')closeModal()};
+    m.querySelector('[data-close]').focus();
   }
   const v=visibleImages(),idx=v.findIndex(y=>y.imageId===x.imageId);
   $('#mc').textContent=(idx+1)+' / '+v.length;
@@ -1217,13 +1174,14 @@ function openModal(){
   const bits=[x.size,x.quality,x.createdAt?new Date(x.createdAt).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):''].filter(b=>b&&b!=='auto');
   $('#msub').textContent=bits.join(' \\u00b7 ');
 }
-function closeModal(){selected=null;const m=$('#modal');m.classList.remove('open');m.setAttribute('aria-hidden','true');m.innerHTML=''}
+function closeModal(){const id=selected?.imageId;selected=null;const m=$('#modal');m.classList.remove('open');m.setAttribute('aria-hidden','true');m.innerHTML='';Array.from(document.querySelectorAll('.tile[data-id]')).find(t=>t.dataset.id===id)?.focus()}
 function move(delta){const v=visibleImages();if(!selected||!v.length)return;const i=v.findIndex(x=>x.imageId===selected.imageId);selected=v[(i+delta+v.length)%v.length];openModal()}
 
 function selectedPrompt(){return selected?.batchPrompt||selected?.prompt||''}
 function setComposerPrompt(text){ta.value=text;autosize();ta.focus();closeModal()}
 async function act(a){
   if(!selected)return;
+  if(a==='annotate'){const result=await api('/api/annotate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({imageId:selected.imageId})});return toast(result.dismissed?'Review closed':'Feedback returned to OMP')}
   if(a==='copyprompt'){await navigator.clipboard.writeText(selectedPrompt());return toast('Prompt copied')}
   if(a==='vary')return setComposerPrompt(selectedPrompt()+'\\n\\nVariation: ');
   if(a==='rerun'){startGeneration(selectedPrompt(),count);toast('Rerunning');return}
@@ -1263,6 +1221,7 @@ $$('#filters [data-filter]').forEach(b=>b.onclick=()=>{$$('#filters [data-filter
 
 document.addEventListener('keydown',e=>{
   if($('#modal').classList.contains('open')){
+    if(e.key==='Tab'){const buttons=Array.from($('#modal').querySelectorAll('button:not(:disabled)'));const first=buttons[0],last=buttons[buttons.length-1];if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}return}
     if(e.key==='Escape')closeModal();
     if(e.key==='ArrowRight')move(1);
     if(e.key==='ArrowLeft')move(-1);
@@ -1367,6 +1326,106 @@ export default function imagegen(pi: ExtensionAPI) {
 	let studioToken = randomUUID();
 	let lastCtx: ExtensionContext | undefined;
 	const studioEventClients = new Set<ServerResponse>();
+	let sessionEpoch = 0;
+	let annotationPending = false;
+	let galleryAbort: AbortController | undefined;
+
+	async function openNativeGallery(items: GalleryItem[], sessionId: string) {
+		const ctx = lastCtx;
+		if (!ctx?.hasUI || ctx.mode !== "tui") throw new Error("Native gallery requires interactive OMP.");
+		if (ctx.sessionManager.getSessionId() !== sessionId) throw new Error("Open this gallery in its originating session.");
+		if (galleryAbort) return;
+		const controller = new AbortController();
+		galleryAbort = controller;
+		const epoch = sessionEpoch;
+		try {
+			const choice = await ctx.ui.custom<GalleryChoice>(
+				(tui, _theme, _keys, done) => new GalleryModal(items, () => tui.requestRender(), done),
+				{ overlay: true, overlayOptions: { anchor: "center", width: "94%", maxHeight: "94%" }, signal: controller.signal },
+			);
+			if (!choice || epoch !== sessionEpoch || controller.signal.aborted) return;
+			if (choice.action === "annotate") {
+				const metadata = await findMetadataByImageId(choice.item.imageId);
+				if (!metadata) throw new Error("The selected image is no longer in the index.");
+				await annotateImage(metadata);
+			} else {
+				insertImageIntoPrompt(choice.item.savedPath, ctx);
+				pi.sendMessage({
+					customType: "imagegen-selection",
+					content: `Выбрано изображение: ${choice.item.savedPath}\nНе генерируй и не изменяй файл без следующего указания.`,
+					display: true,
+					details: { imageId: choice.item.imageId, savedPath: choice.item.savedPath },
+				}, { deliverAs: "nextTurn" });
+			}
+		} catch (error) {
+			if (!controller.signal.aborted && epoch === sessionEpoch) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+		} finally {
+			if (galleryAbort === controller) galleryAbort = undefined;
+		}
+	}
+
+	function publishNativeGallery(items: GalleryItem[], ctx: ExtensionContext) {
+		lastCtx = ctx;
+		pi.sendMessage({
+			customType: "imagegen-gallery",
+			content: items.length ? `Галерея: ${items.length} изображений. Открой превью или /img gallery open.` : "В галерее пока нет изображений. Добавь файлы через /img import.",
+			display: true,
+			details: { items: items.map(({ imageId, savedPath, mimeType }) => ({ imageId, savedPath, mimeType })), sessionId: ctx.sessionManager.getSessionId() },
+		});
+	}
+
+	pi.registerMessageRenderer<{ items: GalleryItem[]; sessionId: string }>("imagegen-gallery", message => {
+		const details = message.details;
+		if (!details || !Array.isArray(details.items)) return undefined;
+		return new GalleryPreview(details.items, () => { void openNativeGallery(details.items, details.sessionId).catch(error => lastCtx?.ui.notify(String(error), "error")); });
+	});
+
+
+	function requestPlannotator(action: string, payload: unknown, timeout?: number): Promise<unknown> {
+		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+		const timer = timeout ? setTimeout(() => reject(new Error("Plannotator is not loaded. Restart OMP with the installed plugin.")), timeout) : undefined;
+		pi.events.emit("plannotator:request", {
+			requestId: randomUUID(), action, payload,
+			respond: (response: unknown) => {
+				clearTimeout(timer);
+				if (!response || typeof response !== "object" || !("status" in response)) return reject(new Error("Invalid Plannotator response."));
+				if (response.status === "handled" && "result" in response) resolve(response.result);
+				else reject(new Error("error" in response ? String(response.error) : "Plannotator is unavailable."));
+			},
+		});
+		return promise;
+	}
+
+	async function annotateImage(metadata: ImagegenMetadata) {
+		if (annotationPending) throw new Error("An image review is already open.");
+		annotationPending = true;
+		const epoch = sessionEpoch;
+		try {
+			await requestPlannotator("review-status", { reviewId: `probe-${randomUUID()}` }, 5000);
+			const directory = join(getAgentDir(), "generated-images", "reviews", randomUUID());
+			const filePath = join(directory, "review.md");
+			const imageName = `wallpaper${extname(metadata.savedPath).toLowerCase()}`;
+			const markdown = `# Wallpaper feedback\n\nImage: ${metadata.savedPath}\n\n![Selected wallpaper](${imageName})\n\nOpen the image to mark it up. Describe what to change and what to preserve. Do not regenerate until requested.\n`;
+			await mkdir(dirname(filePath), { recursive: true });
+			await copyFile(metadata.savedPath, join(directory, imageName));
+			await writeFile(filePath, markdown, "utf8");
+			const result = await requestPlannotator("annotate", { filePath, markdown });
+			if (epoch !== sessionEpoch) throw new Error("The originating session changed; feedback was not sent to another session.");
+			if (!result || typeof result !== "object") throw new Error("Invalid annotation result.");
+			const dismissed = "exit" in result && result.exit === true;
+			if (!dismissed && "feedback" in result && typeof result.feedback === "string" && result.feedback.trim()) {
+				pi.sendMessage({
+					customType: "imagegen-feedback",
+					content: `Wallpaper feedback for ${metadata.savedPath}\n\n${result.feedback}`,
+					display: true,
+					details: { imageId: metadata.imageId, savedPath: metadata.savedPath },
+				});
+			}
+			return { ok: true, dismissed };
+		} finally {
+			annotationPending = false;
+		}
+	}
 
 	function broadcastStudioEvent(event: string, data: unknown) {
 		const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -1411,6 +1470,8 @@ export default function imagegen(pi: ExtensionAPI) {
 			return;
 		}
 		if (url.pathname === "/favicon.ico") return writeText(res, 204, "");
+		if (url.searchParams.get("token") !== studioToken) return writeText(res, 403, "Invalid studio token");
+		if (req.headers.origin && req.headers.origin !== getRequestOrigin(req)) return writeText(res, 403, "Cross-origin request refused");
 		if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/studio")) return writeHtml(res, renderStudioPage(studioToken));
 		if (req.method === "GET" && url.pathname === "/events") return handleStudioEvents(req, res);
 		if (req.method === "GET" && url.pathname === "/api/images") return writeJson(res, 200, { images: await readRecentMetadata(1000) });
@@ -1458,6 +1519,12 @@ export default function imagegen(pi: ExtensionAPI) {
 				writeText(res, 404, "Image file not found");
 			}
 			return;
+		}
+		if (req.method === "POST" && url.pathname === "/api/annotate") {
+			const body = await readJsonBody(req);
+			const metadata = await findMetadataByImageId(String(body.imageId ?? ""));
+			if (!metadata) return writeJson(res, 404, { ok: false, error: "Image not found" });
+			return writeJson(res, 200, await annotateImage(metadata));
 		}
 		if (req.method === "POST" && url.pathname === "/api/generate") {
 			if (!lastCtx) return writeJson(res, 400, { ok: false, error: "No active Pi context." });
@@ -1544,12 +1611,19 @@ export default function imagegen(pi: ExtensionAPI) {
 		return studioBaseUrl;
 	}
 
-	async function openStudio(ctx: ExtensionContext) {
+	async function openStudio(ctx: ExtensionContext, noOpen = false) {
 		lastCtx = ctx;
 		const base = await ensureStudioServer();
 		const url = `${base}/studio?token=${encodeURIComponent(studioToken)}`;
+		pi.sendMessage({ customType: "imagegen-studio", content: `Image studio: ${url}`, display: true, details: { url } });
+		if (noOpen) return url;
 		try {
-			await openBrowser(url);
+			if (process.env.TERN_PANE) {
+				const result = await pi.exec("tern", ["browser", JSON.stringify({ op: "open", owner: process.env.TERN_PANE, url })]);
+				if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Tern browser could not open the studio.");
+			} else {
+				await openBrowser(url);
+			}
 			ctx.ui.notify("Image studio opened.", "info");
 		} catch (error) {
 			ctx.ui.notify("Could not open browser automatically. Copy the studio URL from the message.", "warning");
@@ -1560,19 +1634,25 @@ export default function imagegen(pi: ExtensionAPI) {
 				details: { url },
 			});
 		}
+		return url;
 	}
 
 	pi.on("session_start", (_event, ctx) => {
 		lastCtx = ctx;
+		sessionEpoch++;
+		galleryAbort?.abort();
 	});
 
+	pi.on("session_switch", (_event, ctx) => { galleryAbort?.abort(); sessionEpoch++; lastCtx = ctx; });
 	pi.on("session_shutdown", async () => {
+		galleryAbort?.abort();
 		for (const client of studioEventClients) client.end();
 		studioEventClients.clear();
 		if (studioServer) await new Promise<void>((resolve) => studioServer!.close(() => resolve()));
 		studioServer = undefined;
 		studioBaseUrl = undefined;
 		lastCtx = undefined;
+		sessionEpoch++;
 	});
 
 	pi.registerMessageRenderer("imagegen-result", (message, _options, theme) => {
@@ -1626,6 +1706,24 @@ export default function imagegen(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "image_gallery",
+		label: "Image gallery",
+		description: "Show local PNG/JPEG/WebP images as a native preview in the OMP chat. Click to open a same-pane modal slider and select an image. Never opens a browser or another Tern pane; does not generate images or modify originals.",
+		parameters: Type.Object({ paths: Type.Array(Type.String(), { minItems: 1, maxItems: 100 }) }),
+		async execute(_id, params, _signal, _update, ctx) {
+			const imported = await importImages(params.paths, ctx.cwd);
+			broadcastStudioEvent("imagegen:generated", {});
+			lastCtx = ctx;
+			return { content: [{ type: "text", text: `Галерея из ${imported.length} изображений добавлена в чат. Нажми на превью или «Смотреть варианты», чтобы открыть слайдер в этой же панели.` }], details: { images: imported, sessionId: ctx.sessionManager.getSessionId() } };
+		},
+		renderResult(result) {
+			const details = result.details as { images?: GalleryItem[]; sessionId?: string } | undefined;
+			if (!details?.images || !details.sessionId) return new Text("Галерея недоступна.", 0, 0);
+			return new GalleryPreview(details.images, () => { void openNativeGallery(details.images!, details.sessionId!).catch(error => lastCtx?.ui.notify(String(error), "error")); });
+		},
+	});
+
 
 	pi.registerCommand("img", {
 		description: "Image workflows: /img gen|list|open|reveal|path|info ...",
@@ -1644,6 +1742,9 @@ export default function imagegen(pi: ExtensionAPI) {
 						"/img batch <count> [--thinking off|minimal|low|medium|high] [--style name] <prompt>",
 						"/img styles",
 						"/img studio",
+						"/img gallery — native in-chat gallery",
+						'/img import "/absolute/path/one.png" "/absolute/path/two.png"',
+						"/img studio --no-open",
 						"/img list [count]",
 						"/img open [latest|number|path]",
 						"/img reveal [latest|number|path]",
@@ -1655,8 +1756,29 @@ export default function imagegen(pi: ExtensionAPI) {
 				return;
 			}
 
-			if (["studio", "gallery", "browse"].includes(subcommand)) {
-				await openStudio(ctx);
+			if (subcommand === "gallery" || subcommand === "browse") {
+				lastCtx = ctx;
+				const items = await readRecentMetadata(100);
+				if (!items.length) {
+					ctx.ui.notify("В галерее пока нет изображений. Добавь файлы через /img import.", "info");
+					return;
+				}
+				if (rest === "open") await openNativeGallery(items, ctx.sessionManager.getSessionId());
+				else publishNativeGallery(items, ctx);
+				return;
+			}
+
+			if (subcommand === "studio") {
+				await openStudio(ctx, rest === "--no-open");
+				return;
+			}
+
+			if (subcommand === "import") {
+				const paths = parseImgArgs(rest).positional;
+				if (!paths.length) throw new Error('Usage: /img import "/path/one.png" "/path/two.png"');
+				const imported = await importImages(paths, ctx.cwd);
+				broadcastStudioEvent("imagegen:generated", {});
+				ctx.ui.notify(`Imported ${imported.length} images. Open /img gallery.`, "info");
 				return;
 			}
 
