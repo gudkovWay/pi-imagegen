@@ -17,11 +17,10 @@ import { StringEnum } from "@mariozechner/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "typebox";
+import { buildRequest, IMAGE_MODEL, mimeFromFormat } from "./image-request";
 
 const PROVIDER = "openai-codex";
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-const DEFAULT_RESPONSE_MODEL = "gpt-5.5";
-const IMAGE_MODEL = "gpt-image-2";
 
 const SIZES = ["auto", "1024x1024", "1536x1024", "1024x1536"] as const;
 const QUALITIES = ["auto", "low", "medium", "high"] as const;
@@ -80,7 +79,7 @@ const TOOL_PARAMS = Type.Object({
 	),
 });
 
-type ToolParams = Static<typeof TOOL_PARAMS>;
+export type ToolParams = Static<typeof TOOL_PARAMS>;
 
 interface ImagegenMetadata {
 	createdAt: string;
@@ -145,11 +144,6 @@ function getAccountId(token: string): string {
 	return accountId;
 }
 
-function mimeFromFormat(format: string): string {
-	if (format === "jpeg") return "image/jpeg";
-	if (format === "webp") return "image/webp";
-	return "image/png";
-}
 
 function extensionFromFormat(format: string): string {
 	return format === "jpeg" ? "jpg" : format;
@@ -338,54 +332,6 @@ function insertImageIntoPrompt(path: string, ctx: ExtensionContext | undefined):
 	return true;
 }
 
-async function buildRequest(params: ToolParams, responseModel: string, sessionId: string) {
-	const size = params.size ?? "auto";
-	const quality = params.quality ?? "auto";
-	const background = params.background ?? "auto";
-	const outputFormat = params.outputFormat ?? "png";
-	const thinking = params.thinking ?? "low";
-	const content: any[] = [{ type: "input_text", text: `Generate this image: ${params.prompt}` }];
-	for (const path of params.referencePaths ?? []) {
-		const format = extname(path).toLowerCase() === ".jpg" ? "jpeg" : extname(path).toLowerCase().replace(/^\./, "") || "png";
-		const mimeType = mimeFromFormat(format);
-		const data = await readFile(path);
-		content.push({ type: "input_image", image_url: `data:${mimeType};base64,${data.toString("base64")}` });
-	}
-	const request: any = {
-		model: responseModel,
-		store: false,
-		stream: true,
-		instructions:
-			"You are an image generation dispatcher. Use the image_generation tool to create exactly the image requested by the user. Do not write code.",
-		input: [
-			{
-				role: "user",
-				content,
-			},
-		],
-		text: { verbosity: "low" },
-		prompt_cache_key: sessionId,
-		tool_choice: "auto",
-		parallel_tool_calls: true,
-		tools: [
-			{
-				type: "image_generation",
-				background,
-				model: IMAGE_MODEL,
-				moderation: "auto",
-				output_compression: 100,
-				output_format: outputFormat,
-				quality,
-				size,
-			},
-		],
-	};
-	if (thinking !== "off") {
-		request.include = ["reasoning.encrypted_content"];
-		request.reasoning = { effort: thinking, summary: "auto" };
-	}
-	return request;
-}
 
 async function parseSseForImage(response: Response, signal?: AbortSignal) {
 	if (!response.body) throw new Error("No response body from Codex image generation request.");
@@ -451,7 +397,6 @@ async function parseSseForImage(response: Response, signal?: AbortSignal) {
 
 type ImagegenContext = {
 	cwd: string;
-	model?: { provider: string; id: string };
 	modelRegistry: { getApiKeyForProvider: (provider: string) => Promise<string | undefined> };
 };
 
@@ -470,9 +415,9 @@ async function generateImage(
 	}
 
 	const accountId = getAccountId(token);
-	const responseModel = ctx.model?.provider === PROVIDER ? ctx.model.id : DEFAULT_RESPONSE_MODEL;
 	const sessionId = randomUUID();
-	const body = await buildRequest(params, responseModel, sessionId);
+	const body = await buildRequest(params, sessionId);
+	const responseModel = body.model;
 	const outputFormat = params.outputFormat ?? "png";
 	const mimeType = mimeFromFormat(outputFormat);
 

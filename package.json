@@ -13,6 +13,7 @@
   ],
   "files": [
     "imagegen.ts",
+    "image-request.ts",
     "README.md"
   ],
   "repository": {
